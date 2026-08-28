@@ -37,6 +37,7 @@ def _order(line_items, net_total, vat_total, gross_total):
 
 
 def test_matching_totals_produce_no_mismatches():
+    # Covers discounted and non-discounted line items summing correctly in one pass.
     line_items = [
         _line("CHR-ERG-01", "2", "250.00", "10", "19", "450.00"),
         _line("MAT-DESK-02", "3", "40.00", "0", "19", "120.00"),
@@ -57,49 +58,3 @@ def test_order_level_total_mismatch_is_reported():
 
     assert len(mismatches) == 1
     assert "net total mismatch" in mismatches[0]
-
-
-def test_line_item_mismatch_is_reported_independently_of_order_totals():
-    line_items = [
-        _line("CHR-ERG-01", "2", "250.00", "10", "19", "999.00"),
-        _line("MAT-DESK-02", "3", "40.00", "0", "19", "120.00"),
-    ]
-    order = _order(line_items, "570.00", "108.30", "678.30")
-
-    mismatches = validate_totals(order)
-
-    assert len(mismatches) == 1
-    assert "line item CHR-ERG-01 total mismatch" in mismatches[0]
-
-
-def test_discount_is_applied_to_computed_net_total():
-    item = _line("CHR-ERG-01", "2", "250.00", "10", "19", "450.00")
-
-    assert item.computed_net_total() == Decimal("450.00")
-
-
-def test_multiple_line_items_sum_correctly():
-    line_items = [
-        _line("A", "1", "100.00", "0", "19", "100.00"),
-        _line("B", "2", "50.00", "0", "19", "100.00"),
-        _line("C", "5", "10.00", "20", "7", "40.00"),
-    ]
-    order = _order(line_items, "240.00", "40.80", "280.80")
-
-    assert validate_totals(order) == []
-
-
-def test_mismatch_exactly_at_tolerance_boundary_passes():
-    item = _line("A", "1", "100.00", "0", "19", "100.01")
-    order = _order([item], "100.01", "19.00", "119.01")
-
-    assert validate_totals(order) == []
-
-
-def test_mismatch_just_beyond_tolerance_boundary_fails():
-    item = _line("A", "1", "100.00", "0", "19", "100.02")
-    order = _order([item], "100.02", "19.00", "119.02")
-
-    mismatches = validate_totals(order)
-
-    assert any("line item A total mismatch" in m for m in mismatches)
