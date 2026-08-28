@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.14"
 dependencies = [
     "anthropic>=1.2.0",
+    "pywinauto>=0.6.9",
 ]
 
 [project.scripts]
