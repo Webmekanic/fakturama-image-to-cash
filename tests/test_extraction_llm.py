@@ -69,9 +69,6 @@ class _FakeClient:
         self.messages = _FakeMessages(text)
 
 
-# --- parse_order_payload: structural/content validation -------------------
-
-
 def test_parse_order_payload_accepts_valid_response():
     order = parse_order_payload(_valid_payload())
 
@@ -101,9 +98,6 @@ def test_parse_order_payload_rejects_totals_mismatch():
 
     with pytest.raises(ExtractionError, match="totals validation failed"):
         parse_order_payload(payload)
-
-
-# --- extract_order: LLM call + response parsing ----------------------------
 
 
 def test_extract_order_parses_valid_llm_response(tmp_path):
