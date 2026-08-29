@@ -1,21 +1,8 @@
-"""Orchestrates the full Order-image -> verified linked Invoice workflow.
-
-Lives outside uia.py deliberately: it depends on both extraction.py and uia.py to
-sequence one continuous run, so it doesn't belong inside either module without
-blurring their existing single-responsibility boundaries (uia.py = Fakturama UI
-Automation only; extraction.py = image parsing only).
-"""
-
 from . import uia
 from .extraction import extract_order
 
 
 def run_workflow(image_path: str, client=None):
-    """Extract order_data from image_path and drive it through Fakturama end to end.
-
-    Returns (order_title, invoice_title) - the saved document numbers - once every
-    step has completed and verified without raising ManualReviewRequired.
-    """
     order_data = extract_order(image_path, client=client)
 
     window = uia.connect_main_window()
