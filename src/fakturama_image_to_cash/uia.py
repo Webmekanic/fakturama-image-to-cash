@@ -81,6 +81,23 @@ def _price_mode_combo(window):
     return candidates[0]
 
 
+def _payment_method_combo(window, paid_cb):
+    """The Invoice's payment-method combo has no accessible name; it sits immediately
+    right of the "paid" checkbox on the same row - confirmed live. It is populated
+    automatically from the Debtor's own Payment Method (set via
+    resolve_or_create_payment_method), which is why apply_payment_status never needs
+    to set it directly - only verify_final_records reads it back, to confirm spec
+    5.2's "Invoice payment method equals the extracted Payment Method" as a fact
+    rather than an assumption."""
+    paid_rect = paid_cb.rectangle()
+    candidates = [
+        c
+        for c in window.descendants(control_type="ComboBox")
+        if abs(c.rectangle().top - paid_rect.top) < 15 and c.rectangle().left > paid_rect.right
+    ]
+    return min(candidates, key=lambda c: c.rectangle().left)
+
+
 def set_order_header(window, order_date: str, external_reference: str):
     """Set the New Order editor's Date, Cust.Ref., and price mode (Net) fields.
 
@@ -126,6 +143,18 @@ def _type_into(edit, text: str):
     "VAT 19%aVAT 19%" - part of the second call's keystrokes landed on the first
     field before focus had actually finished moving. Polling for the real signal
     (has_keyboard_focus) before typing, rather than a fixed delay, fixed it.
+
+    That focus-race fix was not sufficient on its own: reproduced live on the new
+    term-of-payment form, typing "Bank Transfer" into Name then Description left
+    Name="Ba" and Description="nk TransferaBank Transfer" even with the focus poll in
+    place. Win32 SendInput injects into the global input queue and Fakturama's own SWT
+    event loop can still be draining a field's queued keystrokes when our code moves
+    focus away - has_keyboard_focus() only reports the OS-level focus change, not
+    whether the app has finished processing prior input. Waiting for this field's own
+    get_value() to stop changing before returning closes that gap. This does not
+    compare against the literal input text: numeric/currency fields reformat what was
+    typed (confirmed live: typing "297.50" settles as "$297.50"), so a stability check
+    is used instead of an exact-match check.
     """
     escaped = "".join(f"{{{c}}}" if c in _SEND_KEYS_SPECIAL else c for c in text)
     edit.set_focus()
@@ -135,6 +164,182 @@ def _type_into(edit, text: str):
     edit.type_keys("^a")
     edit.type_keys("{DELETE}")
     edit.type_keys(escaped, with_spaces=True)
+
+    deadline = time.time() + 1.5
+    previous = None
+    while time.time() < deadline:
+        current = edit.get_value()
+        if current == previous:
+            return
+        previous = current
+        time.sleep(0.05)
+
+
+def _zip_city_edits(window):
+    """The 'ZIP - City' row has two unlabeled Edit controls side by side: ZIP on the
+    left, City on the right - confirmed live, no separate labels exist for either."""
+    label = [t for t in window.descendants(control_type="Text") if t.window_text() == "ZIP - City"][0]
+    label_rect = label.rectangle()
+    candidates = sorted(
+        (
+            e
+            for e in window.descendants(control_type="Edit")
+            if abs(e.rectangle().top - label_rect.top) < 15 and not e.window_text()
+        ),
+        key=lambda e: e.rectangle().left,
+    )
+    return candidates[0], candidates[1]
+
+
+def _fill_main_address(window, address, email: str = "", telephone: str = ""):
+    """Fill Street/ZIP/City/Country/E-Mail/Telephone on whichever address sub-tab
+    (Main address, or an additional-address tab added via "+") is currently active.
+
+    Confirmed live: only the active address sub-tab's fields exist in the UIA tree at
+    any moment (switching tabs removes the inactive one's controls, the same behavior
+    already documented for the Order vs. Debtor editor tabs elsewhere in this file), so
+    no extra scoping beyond "make sure the right tab is already active" is needed.
+
+    Country is a real named ComboBox, not a custom-painted grid - confirmed live, with
+    251 options. It suffers the same ValuePattern/selected-text non-persistence bug as
+    every other combo in this app (confirmed live: a freshly opened New Debtor editor's
+    Country defaults to "United States" and nothing previously in this codebase ever
+    changed it), so it is driven through the same proven _select_combo_option keyboard
+    navigation as VAT and price mode, not a faster but unverified type-ahead shortcut.
+    """
+    street_edit = window.child_window(title="Street", control_type="Edit").wrapper_object()
+    _type_into(street_edit, address.street)
+
+    if email:
+        email_edit = window.child_window(title="E-Mail", control_type="Edit").wrapper_object()
+        _type_into(email_edit, email)
+    if telephone:
+        telephone_edit = window.child_window(title="Telephone", control_type="Edit").wrapper_object()
+        _type_into(telephone_edit, telephone)
+
+    zip_edit, city_edit = _zip_city_edits(window)
+    if address.zip_code:
+        _type_into(zip_edit, address.zip_code)
+    if address.city:
+        _type_into(city_edit, address.city)
+
+    if address.country:
+        country_combo = window.child_window(title="Country", control_type="ComboBox").wrapper_object()
+        country_combo.expand()
+        options = [i.window_text() for i in country_combo.descendants(control_type="ListItem")]
+        country_combo.collapse()
+        if address.country not in options:
+            raise ManualReviewRequired(f"country {address.country!r} not found in the Country dropdown")
+        _select_combo_option(country_combo, options, address.country)
+
+
+def _assign_address_role(window, invoice_address: bool = False, delivery_address: bool = False):
+    """Open the active address tab's role picker and check Invoice/Delivery address.
+
+    The unlabeled "address type" field has an adjacent button; clicking it opens a
+    floating popup with real "Invoice address"/"Delivery address" CheckBox controls -
+    confirmed live. Critically, this popup is transient and is dismissed by any
+    window-activation change (confirmed live: calling SetForegroundWindow between
+    opening it and clicking a checkbox closed it before the click could land) - so
+    nothing here may re-foreground the app in between.
+
+    The arrow button's click silently does nothing unless the adjacent Edit already
+    has real keyboard focus - confirmed live via a direct before/after comparison:
+    clicking the arrow cold (right after typing elsewhere) produced zero CheckBox
+    controls even after polling for seconds, while calling set_focus() on the Edit
+    immediately before the same click reliably opened the popup every time.
+
+    On a freshly opened editor, this row also sits partially below the Documents/
+    terms-of-payment panel divider (confirmed live: its measured rectangle extends
+    ~19px past that boundary) - a click on a partially clipped control's reported
+    rectangle can silently land on whatever is actually visible at that screen pixel
+    (the panel below) instead of the control itself, so it is scrolled fully into
+    view first via the same vertical-scrollbar "Line down" button, rather than
+    guessing a fixed number of clicks.
+    """
+    addr_type_label = [t for t in window.descendants(control_type="Text") if t.window_text() == "address type"][0]
+
+    docs_tab = window.child_window(title="Documents", control_type="TabItem")
+    if docs_tab.exists(timeout=1):
+        boundary = docs_tab.wrapper_object().rectangle().top
+        line_down_btns = [b for b in window.descendants(control_type="Button") if b.window_text() == "Line down"]
+        if line_down_btns:
+            line_down = line_down_btns[0]
+            for _ in range(10):
+                if addr_type_label.rectangle().bottom <= boundary:
+                    break
+                line_down.click_input()
+                time.sleep(0.05)
+
+    # Scope everything below to the address-type row's own parent container, not the
+    # whole window: with a New Order tab and a New Debtor tab both resident in the UIA
+    # tree at once (confirmed live - inactive top-level tabs keep their controls, unlike
+    # inactive Main-address-vs-additional-address sub-tabs within one editor, which do
+    # not), a same-window-wide proximity search can coincidentally match some unrelated
+    # control elsewhere that happens to share the same Y-coordinate, silently clicking
+    # the wrong thing instead of the address-type arrow.
+    scope = addr_type_label.parent()
+    label_rect = addr_type_label.rectangle()
+    addr_type_edit = [
+        e for e in scope.descendants(control_type="Edit") if abs(e.rectangle().top - label_rect.top) < 10
+    ][0]
+    edit_rect = addr_type_edit.rectangle()
+    arrow_btn = min(
+        (
+            d
+            for d in scope.descendants()
+            if abs(d.rectangle().top - edit_rect.top) < 10 and d.rectangle().left >= edit_rect.right
+        ),
+        key=lambda d: d.rectangle().left,
+    )
+    addr_type_edit.set_focus()
+    arrow_btn.click_input()
+
+    def _wait_for_checkbox(name: str, timeout: float = 1.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            matches = [c for c in window.descendants(control_type="CheckBox") if c.window_text() == name]
+            if matches:
+                return matches[0]
+            time.sleep(0.05)
+        return None
+
+    # The very first click on this popup within a freshly opened editor reliably
+    # produces zero CheckBox controls even after polling for a full second - confirmed
+    # live, reproduced twice, on an editor that had never opened this popup before. An
+    # immediate second click on the same still-focused arrow button then opens it
+    # correctly every time (also confirmed live) - some part of Fakturama's own
+    # popup Shell is evidently lazily constructed on first use.
+    probe_name = "Invoice address" if invoice_address else "Delivery address"
+    if _wait_for_checkbox(probe_name) is None:
+        arrow_btn.click_input()
+
+    def _require_checkbox(name: str, timeout: float = 2.0):
+        cb = _wait_for_checkbox(name, timeout=timeout)
+        if cb is None:
+            raise ManualReviewRequired(f"address role popup did not render a {name!r} checkbox")
+        return cb
+
+    expected_parts = []
+    if invoice_address:
+        expected_parts.append("Invoice address")
+        cb = _require_checkbox("Invoice address")
+        if cb.get_toggle_state() == 0:
+            cb.set_focus()
+            cb.click_input()
+    if delivery_address:
+        expected_parts.append("Delivery address")
+        cb = _require_checkbox("Delivery address")
+        if cb.get_toggle_state() == 0:
+            cb.set_focus()
+            cb.click_input()
+
+    # Click elsewhere to close the popup and commit its selection to the field.
+    window.child_window(title="Company", control_type="Edit").wrapper_object().click_input()
+
+    value = addr_type_edit.get_value()
+    if not all(part in value for part in expected_parts):
+        raise ManualReviewRequired(f"address role assignment did not persist: expected {expected_parts}, got {value!r}")
 
 
 def _address_dialog(window, timeout: int = 10):
@@ -234,6 +439,65 @@ def _ask_vision_match(image, value: str, column: str = "Company", client=None) -
     return _parse_vision_json(text)
 
 
+_DEBTOR_MATCH_PROMPT = """This image is a cropped search-results table from an accounting \
+app (columns typically include No., First Names, Names, Company, ZIP, City), filtered by \
+company "{company}".
+
+Respond with ONLY a JSON object of this shape:
+{{"row_count": <int>, "exact_match_count": <int>, "exact_match_y_fraction": <float 0.0-1.0 or null>}}
+
+row_count = number of rows that contain any visible text/data (excluding the header row).
+Empty grid lines with no text in them do not count as rows - an empty results table is
+row_count 0, even if faint row-separator lines extend down the pane.
+exact_match_count = number of rows where ALL of the following match exactly (ignoring \
+case and surrounding whitespace): Company = "{company}", First Names = "{first_name}", \
+Names = "{last_name}", ZIP = "{zip_code}", City = "{city}". Treat an expected value of \
+"" (empty) as matching any value in that column - only compare fields with a non-empty \
+expected value.
+exact_match_y_fraction = if exact_match_count is exactly 1, that row's vertical center \
+as a fraction of the image height (0.0 = top, 1.0 = bottom); otherwise null."""
+
+
+def _ask_vision_debtor_match(image, debtor, client=None) -> dict:
+    """Like _ask_vision_match, but requires Company/First Name/Name/ZIP/City to all
+    match (per the spec's exact-match criteria for reusing an existing Debtor), not
+    just Company - reduces false-positive matches between same-named companies at
+    different addresses or contacts."""
+    import anthropic
+
+    client = client or anthropic.Anthropic()
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    image_data = base64.standard_b64encode(buf.getvalue()).decode("utf-8")
+
+    first_name, _, last_name = debtor.contact_name.partition(" ")
+    response = client.messages.create(
+        model=VISION_MODEL,
+        max_tokens=1024,
+        output_config={"effort": "low"},
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": image_data}},
+                    {
+                        "type": "text",
+                        "text": _DEBTOR_MATCH_PROMPT.format(
+                            company=debtor.company,
+                            first_name=first_name,
+                            last_name=last_name,
+                            zip_code=debtor.billing_address.zip_code,
+                            city=debtor.billing_address.city,
+                        ),
+                    },
+                ],
+            }
+        ],
+    )
+    text = next((block.text for block in response.content if block.type == "text"), "")
+    return _parse_vision_json(text)
+
+
 def _address_preview_edit(pane):
     """The address preview has no name. On the Order editor it's the only blank Edit
     in this pane, but the Invoice editor also has blank-named Order Date/Service date
@@ -242,8 +506,12 @@ def _address_preview_edit(pane):
     return max(blank_edits, key=lambda e: e.rectangle().height())
 
 
-def resolve_debtor(window, company_name: str, client=None) -> str:
-    """Search the Order's address selector for company_name and act on the result.
+def resolve_debtor(window, debtor, client=None) -> str:
+    """Search the Order's address selector for debtor.company and act on the result.
+
+    A row is only treated as an exact match when Company, First Name, Name, ZIP, and
+    City all agree with debtor (per the spec's exact-match criteria) - not Company
+    alone, which could false-match a same-named company at a different address.
 
     Returns "selected" (exact match chosen and linked to the Order) or "no_match".
     Raises ManualReviewRequired if more than one row is an exact match.
@@ -251,13 +519,13 @@ def resolve_debtor(window, company_name: str, client=None) -> str:
     dialog = _address_dialog(window)
     search_edit = dialog.descendants(control_type="Edit")[0]
     search_edit.set_focus()
-    search_edit.type_keys(company_name, with_spaces=True)
+    search_edit.type_keys(debtor.company, with_spaces=True)
     time.sleep(1.0)  # Fakturama rebuilds part of the dialog's widget tree after filtering,
     search_edit = dialog.descendants(control_type="Edit")[0]  # invalidating the old reference
     results_pane = _results_pane(dialog, search_edit)
     _wait_for_grid_to_settle(results_pane)
 
-    match = _ask_vision_match(results_pane.capture_as_image(), company_name, client=client)
+    match = _ask_vision_debtor_match(results_pane.capture_as_image(), debtor, client=client)
 
     def click_button(name):
         btn = [b for b in dialog.descendants(control_type="Button") if b.window_text() == name][0]
@@ -270,7 +538,7 @@ def resolve_debtor(window, company_name: str, client=None) -> str:
 
     if match["exact_match_count"] != 1:
         click_button("Cancel")
-        raise ManualReviewRequired(f"debtor search for {company_name!r} is ambiguous: {match}")
+        raise ManualReviewRequired(f"debtor search for {debtor.company!r} is ambiguous: {match}")
 
     # No row-level UIA element exists to invoke/select (confirmed: zero non-chrome
     # descendants under the results pane) - a click at the live-resolved pane's own
@@ -285,13 +553,108 @@ def resolve_debtor(window, company_name: str, client=None) -> str:
     cust_ref_edit = window.child_window(title="Cust.Ref.", control_type="Edit").wrapper_object()
     preview = _address_preview_edit(cust_ref_edit.parent())
     if not preview.get_value().strip():
-        raise ManualReviewRequired(f"selecting {company_name!r} did not populate the Order's address")
+        raise ManualReviewRequired(f"selecting {debtor.company!r} did not populate the Order's address")
 
     return "selected"
 
 
-def create_debtor(window, company: str, first_name: str, last_name: str, street: str):
-    """Open a New Debtor editor (Order stays open), fill it, and save."""
+def resolve_or_create_payment_method(window, payment_method: str):
+    """Ensure payment_method exists as a term of payment and select it on the open
+    Debtor editor's Payment combo.
+
+    Mirrors resolve_or_create_vat: the Debtor's own Payment ComboBox lists every term
+    of payment by name via ExpandCollapse + ListItem children - confirmed live, same
+    mechanism as the VAT combo, so no vision call is needed. Only "Pay Cash" exists by
+    default (confirmed live).
+    """
+    payment_combo = window.child_window(title="Payment", control_type="ComboBox").wrapper_object()
+    payment_combo.expand()
+    options = [i.window_text() for i in payment_combo.descendants(control_type="ListItem")]
+    payment_combo.collapse()
+    if payment_method in options:
+        _select_combo_option(payment_combo, options, payment_method)
+        return
+
+    # Data > terms of payment - same nav-label-double-click pattern as Data > VATs.
+    terms_label = [t for t in window.descendants(control_type="Text") if t.window_text() == "terms of payment"][0]
+    terms_label.set_focus()
+    terms_label.double_click_input()
+
+    create_btn = [
+        b for b in window.descendants(control_type="Button") if b.window_text() == "Create a new term of payment"
+    ][0]
+    create_btn.invoke()
+
+    name_edit = window.child_window(title="Name", control_type="Edit").wrapper_object()
+    desc_edit = window.child_window(title="Description", control_type="Edit").wrapper_object()
+    _type_into(name_edit, payment_method)
+    _type_into(desc_edit, payment_method)
+
+    # Fakturama's payment-code combo is missing its i18n string and exposes the raw
+    # resource key as its accessible name - confirmed live, used here as-is since it's
+    # still a stable, real selector. Option text carries a trailing space - confirmed
+    # live (e.g. "Credit transfer ", not "Credit transfer").
+    code_map = {
+        "Bank Transfer": "Credit transfer ",
+        "Credit Card": "Credit card ",
+        "SEPA Direct Debit": "SEPA direct debit ",
+    }
+    code_target = code_map.get(payment_method)
+    if code_target is None:
+        raise ManualReviewRequired(f"no payment-code mapping is known for payment method {payment_method!r}")
+
+    code_combo = window.child_window(title="!editorPaymentPaymentcode!", control_type="ComboBox").wrapper_object()
+    code_combo.expand()
+    code_options = [i.window_text() for i in code_combo.descendants(control_type="ListItem")]
+    code_combo.collapse()
+    if code_target not in code_options:
+        raise ManualReviewRequired(f"payment code {code_target!r} not found in dropdown: {code_options}")
+    _select_combo_option(code_combo, code_options, code_target)
+
+    cash_discount = window.child_window(title="Cash discount", control_type="Edit").wrapper_object()
+    discount_days = window.child_window(title="Discount Days", control_type="Edit").wrapper_object()
+    net_days = window.child_window(title="Net Days", control_type="Edit").wrapper_object()
+    _type_into(cash_discount, "0")
+    _type_into(discount_days, "0")
+    _type_into(net_days, "0")
+
+    save_btn = [
+        b for b in window.descendants(control_type="Button") if b.window_text() == "Save the current contents"
+    ][0]
+    try:
+        save_btn.invoke()
+    except Exception:
+        save_btn.click_input()
+
+    # Return to the Debtor editor and re-expand Payment - mirrors the already-proven
+    # fix for the product editor's VAT combo caching stale options from before the new
+    # row existed. Unlike the VAT case, the Debtor editor doesn't need to be closed and
+    # reopened: it's a different tab entirely (not the tab that created the payment
+    # method), so simply reactivating it and re-querying the combo is enough.
+    debtor_tab = window.child_window(title_re=r"\*?New Debtor", control_type="TabItem").wrapper_object()
+    try:
+        debtor_tab.set_focus()
+    except Exception:
+        pass
+    debtor_tab.click_input()
+
+    payment_combo = window.child_window(title="Payment", control_type="ComboBox").wrapper_object()
+    payment_combo.expand()
+    options = [i.window_text() for i in payment_combo.descendants(control_type="ListItem")]
+    payment_combo.collapse()
+    if payment_method not in options:
+        raise ManualReviewRequired(f"created payment method {payment_method!r} did not appear in the Payment dropdown")
+    _select_combo_option(payment_combo, options, payment_method)
+
+
+def create_debtor(window, debtor):
+    """Open a New Debtor editor (Order stays open), fill it fully, and save.
+
+    debtor: an extraction.Debtor. Fills Company/First/Last Name, the Main address
+    (Street/ZIP/City/Country/E-Mail/Telephone) with the Invoice address role assigned,
+    a second address tab with the Delivery address role when billing and delivery
+    differ, Miscellaneous (Alias/Discount/Net-or-Gross), and the Payment Method.
+    """
     new_contact_btn = [
         b for b in window.descendants(control_type="SplitButton") if b.window_text() == "Create a new contact"
     ][0]
@@ -309,12 +672,49 @@ def create_debtor(window, company: str, first_name: str, last_name: str, street:
         key=lambda e: e.rectangle().left,
     )
     first_name_edit, last_name_edit = name_edits[0], name_edits[1]
-    street_edit = [e for e in scope.descendants(control_type="Edit") if e.window_text() == "Street"][0]
 
-    _type_into(company_edit, company)
-    _type_into(first_name_edit, first_name)
+    # Naive split on the first space; falls back to the company name if contact_name is blank.
+    first_name, _, last_name = debtor.contact_name.partition(" ")
+    _type_into(company_edit, debtor.company)
+    _type_into(first_name_edit, first_name or debtor.company)
     _type_into(last_name_edit, last_name)
-    _type_into(street_edit, street)
+
+    # Main address sub-tab is active by default on a freshly opened New Debtor editor.
+    _fill_main_address(window, debtor.billing_address, debtor.email, debtor.telephone)
+
+    same_address = debtor.billing_address == debtor.delivery_address
+    _assign_address_role(window, invoice_address=True, delivery_address=same_address)
+
+    if not same_address:
+        # "+" adds a second address sub-tab (titled "additional address #N") with the
+        # same field layout as Main address - confirmed live. Its own "address type"
+        # popup assigns the Delivery address role independently of Main address's.
+        plus_btn = min(
+            (b for b in window.descendants(control_type="Button") if b.window_text() == "+"),
+            key=lambda b: b.rectangle().top,
+        )
+        plus_btn.click_input()
+        window.child_window(title_re=r"additional address #\d+", control_type="TabItem").wait("exists", timeout=5)
+        _fill_main_address(window, debtor.delivery_address)
+        _assign_address_role(window, invoice_address=False, delivery_address=True)
+
+    misc_tab = window.child_window(title="Miscellaneous", control_type="TabItem").wrapper_object()
+    misc_tab.click_input()
+
+    if debtor.alias:
+        alias_edit = window.child_window(title="Alias name", control_type="Edit").wrapper_object()
+        _type_into(alias_edit, debtor.alias)
+
+    discount_edit = window.child_window(title="Discount", control_type="Edit").wrapper_object()
+    _type_into(discount_edit, "0")
+
+    net_gross_combo = window.child_window(title="Net or Gross", control_type="ComboBox").wrapper_object()
+    net_gross_combo.expand()
+    net_gross_options = [i.window_text() for i in net_gross_combo.descendants(control_type="ListItem")]
+    net_gross_combo.collapse()
+    _select_combo_option(net_gross_combo, net_gross_options, "Net")
+
+    resolve_or_create_payment_method(window, debtor.payment_method)
 
     save_btn = [
         b for b in window.descendants(control_type="Button") if b.window_text() == "Save the current contents"
@@ -351,15 +751,13 @@ def resolve_or_create_debtor(window, debtor, client=None) -> str:
     Raises ManualReviewRequired on an ambiguous match, or if a freshly created debtor
     cannot be found again on re-search.
     """
-    outcome = resolve_debtor(window, debtor.company, client=client)
+    outcome = resolve_debtor(window, debtor, client=client)
     if outcome == "selected":
         return "selected_existing"
 
-    # Naive split on the first space; falls back to the company name if contact_name is blank.
-    first_name, _, last_name = debtor.contact_name.partition(" ")
-    create_debtor(window, debtor.company, first_name or debtor.company, last_name, debtor.billing_address)
+    create_debtor(window, debtor)
 
-    outcome = resolve_debtor(window, debtor.company, client=client)
+    outcome = resolve_debtor(window, debtor, client=client)
     if outcome != "selected":
         raise ManualReviewRequired(f"newly created debtor {debtor.company!r} was not found on re-search")
     return "created_and_selected"
@@ -911,9 +1309,27 @@ def verify_final_records(window, order_data, order_title: str, invoice_title: st
     Collects every mismatch before raising, rather than stopping at the first one.
     """
     mismatches = []
-    expected_address = "\r\n".join(
-        [order_data.debtor.company, order_data.debtor.contact_name, order_data.debtor.billing_address]
-    )
+    # The real preview text (confirmed live) is
+    # "Company\r\nContact\r\nStreet\r\nDE-10115 Berlin\r\nCountry" - it prefixes ZIP
+    # with a two-letter ISO country code we have no way to derive from the extracted
+    # country name, so an exact reconstructed string can't be compared. Checking that
+    # every real extracted field appears somewhere in the preview is robust to that
+    # formatting detail while still verifying each individual piece of data landed.
+    debtor = order_data.debtor
+    expected_address_fields = [
+        debtor.company,
+        debtor.contact_name,
+        debtor.billing_address.street,
+        debtor.billing_address.zip_code,
+        debtor.billing_address.city,
+        debtor.billing_address.country,
+    ]
+
+    def _check_address(actual: str, label: str):
+        missing = [field for field in expected_address_fields if field and field not in actual]
+        if missing:
+            mismatches.append(f"{label} address {actual!r} is missing expected fields: {missing}")
+
     expected_order_date = _format_display_date(order_data.order_date)
     expected_total = f"{order_data.source_gross_total:.2f}"
 
@@ -933,8 +1349,7 @@ def verify_final_records(window, order_data, order_title: str, invoice_title: st
         mismatches.append(f"Order Cust.Ref. {order_cust_ref!r} != extracted {order_data.external_reference!r}")
     if order_date != expected_order_date:
         mismatches.append(f"Order Date {order_date!r} != extracted {expected_order_date!r}")
-    if order_address != expected_address:
-        mismatches.append(f"Order address {order_address!r} != expected {expected_address!r}")
+    _check_address(order_address, "Order")
     if not _amounts_equal(order_total, expected_total):
         mismatches.append(f"Order Total {order_total!r} != expected {expected_total!r}")
 
@@ -954,14 +1369,20 @@ def verify_final_records(window, order_data, order_title: str, invoice_title: st
         mismatches.append(f"Invoice Cust.Ref. {invoice_cust_ref!r} != extracted {order_data.external_reference!r}")
     if invoice_order_date != expected_order_date:
         mismatches.append(f"Invoice Order Date {invoice_order_date!r} != extracted {expected_order_date!r}")
-    if invoice_address != expected_address:
-        mismatches.append(f"Invoice address {invoice_address!r} != expected {expected_address!r}")
+    _check_address(invoice_address, "Invoice")
     if not _amounts_equal(invoice_total, expected_total):
         mismatches.append(f"Invoice Total {invoice_total!r} != expected {expected_total!r}")
 
     paid_cb = window.child_window(title="paid", control_type="CheckBox").wrapper_object()
     is_paid = paid_cb.get_toggle_state() == 1
     expects_paid = order_data.paid_status.strip().lower() in _PAID_STATUS_VALUES
+
+    payment_method_combo = _payment_method_combo(window, paid_cb)
+    actual_payment_method = payment_method_combo.selected_text()
+    if actual_payment_method != order_data.debtor.payment_method:
+        mismatches.append(
+            f"Invoice payment method {actual_payment_method!r} != expected {order_data.debtor.payment_method!r}"
+        )
 
     if is_paid != expects_paid:
         mismatches.append(f"Invoice paid={is_paid} but extracted paid_status={order_data.paid_status!r}")

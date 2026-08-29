@@ -24,8 +24,10 @@ this shape:
     "company": string,
     "contact_name": string,
     "alias": string,
-    "billing_address": string,
-    "delivery_address": string,
+    "email": string,
+    "telephone": string,
+    "billing_address": {"street": string, "zip_code": string, "city": string, "country": string},
+    "delivery_address": {"street": string, "zip_code": string, "city": string, "country": string},
     "payment_method": string
   },
   "line_items": [
@@ -46,8 +48,9 @@ this shape:
   "source_gross_total": number
 }
 
-Use the exact values shown in the image. If billing and delivery addresses are identical, \
-repeat the same address in both fields. If a field is not present in the image, use an \
+Use the exact values shown in the image. Split each address into its street, zip_code, \
+city, and country components. If billing and delivery addresses are identical, repeat \
+the same address object in both fields. If a field is not present in the image, use an \
 empty string (or null for payment_date)."""
 
 
@@ -73,12 +76,22 @@ class LineItem:
 
 
 @dataclass
+class Address:
+    street: str
+    zip_code: str
+    city: str
+    country: str
+
+
+@dataclass
 class Debtor:
     company: str
     contact_name: str
     alias: str
-    billing_address: str
-    delivery_address: str
+    email: str
+    telephone: str
+    billing_address: Address
+    delivery_address: Address
     payment_method: str
 
 
@@ -148,10 +161,13 @@ _REQUIRED_DEBTOR_FIELDS = {
     "company",
     "contact_name",
     "alias",
+    "email",
+    "telephone",
     "billing_address",
     "delivery_address",
     "payment_method",
 }
+_REQUIRED_ADDRESS_FIELDS = {"street", "zip_code", "city", "country"}
 _REQUIRED_LINE_ITEM_FIELDS = {
     "sku",
     "description",
@@ -174,6 +190,20 @@ def _to_decimal(value, field_name: str) -> Decimal:
         return Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError):
         raise ExtractionError(f"invalid numeric value for {field_name}: {value!r}") from None
+
+
+def _parse_address(payload: dict, field_name: str) -> Address:
+    if not isinstance(payload, dict):
+        raise ExtractionError(f"{field_name} must be a JSON object")
+    missing = _REQUIRED_ADDRESS_FIELDS - payload.keys()
+    if missing:
+        raise ExtractionError(f"{field_name} missing required fields: {sorted(missing)}")
+    return Address(
+        street=_require_nonempty(str(payload["street"]), f"{field_name}.street"),
+        zip_code=str(payload["zip_code"]),
+        city=str(payload["city"]),
+        country=str(payload["country"]),
+    )
 
 
 def _parse_line_item(item: dict, index: int) -> LineItem:
@@ -235,8 +265,10 @@ def parse_order_payload(payload: dict) -> OrderData:
         company=_require_nonempty(str(debtor_payload["company"]), "debtor.company"),
         contact_name=str(debtor_payload["contact_name"]),
         alias=str(debtor_payload["alias"]),
-        billing_address=_require_nonempty(str(debtor_payload["billing_address"]), "debtor.billing_address"),
-        delivery_address=str(debtor_payload["delivery_address"]),
+        email=str(debtor_payload["email"]),
+        telephone=str(debtor_payload["telephone"]),
+        billing_address=_parse_address(debtor_payload["billing_address"], "debtor.billing_address"),
+        delivery_address=_parse_address(debtor_payload["delivery_address"], "debtor.delivery_address"),
         payment_method=_require_nonempty(str(debtor_payload["payment_method"]), "debtor.payment_method"),
     )
 

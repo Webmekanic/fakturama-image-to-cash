@@ -1,6 +1,6 @@
 from decimal import Decimal
 
-from fakturama_image_to_cash.extraction import Debtor, LineItem, OrderData, validate_totals
+from fakturama_image_to_cash.extraction import Address, Debtor, LineItem, OrderData, validate_totals
 
 
 def _line(sku, qty, unit_price, discount, vat, source_total):
@@ -23,8 +23,10 @@ def _order(line_items, net_total, vat_total, gross_total):
             company="Northstar Office GmbH",
             contact_name="Marta Klein",
             alias="NORTHSTAR-BERLIN",
-            billing_address="Friedrichstrasse 88, 10117 Berlin",
-            delivery_address="Beusselstrasse 44, 10553 Berlin",
+            email="marta.klein@example.test",
+            telephone="+49 30 5550 1420",
+            billing_address=Address(street="Friedrichstrasse 88", zip_code="10117", city="Berlin", country="Germany"),
+            delivery_address=Address(street="Beusselstrasse 44", zip_code="10553", city="Berlin", country="Germany"),
             payment_method="Bank Transfer",
         ),
         line_items=line_items,

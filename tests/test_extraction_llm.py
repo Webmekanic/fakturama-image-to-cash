@@ -13,8 +13,20 @@ def _valid_payload():
             "company": "Northstar Office GmbH",
             "contact_name": "Marta Klein",
             "alias": "NORTHSTAR-BERLIN",
-            "billing_address": "Friedrichstrasse 88, 10117 Berlin",
-            "delivery_address": "Beusselstrasse 44, 10553 Berlin",
+            "email": "marta.klein@example.test",
+            "telephone": "+49 30 5550 1420",
+            "billing_address": {
+                "street": "Friedrichstrasse 88",
+                "zip_code": "10117",
+                "city": "Berlin",
+                "country": "Germany",
+            },
+            "delivery_address": {
+                "street": "Beusselstrasse 44",
+                "zip_code": "10553",
+                "city": "Berlin",
+                "country": "Germany",
+            },
             "payment_method": "Bank Transfer",
         },
         "line_items": [
