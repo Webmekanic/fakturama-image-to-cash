@@ -187,9 +187,11 @@ def _ask_vision_match(image, value: str, column: str = "Company", client=None) -
 
 
 def _address_preview_edit(pane):
-    """The address preview has no name; it is the sole unnamed Edit in this pane
-    (Cust.Ref. and Consultant are the only named Edits here)."""
-    return [e for e in pane.descendants(control_type="Edit") if not e.window_text()][0]
+    """The address preview has no name. On the Order editor it's the only blank Edit
+    in this pane, but the Invoice editor also has blank-named Order Date/Service date
+    Edits here - so pick the tallest (the address box is multi-line, ~88px vs ~17px)."""
+    blank_edits = [e for e in pane.descendants(control_type="Edit") if not e.window_text()]
+    return max(blank_edits, key=lambda e: e.rectangle().height())
 
 
 def resolve_debtor(window, company_name: str, client=None) -> str:
@@ -594,3 +596,67 @@ def resolve_or_create_product(window, line_item, client=None) -> str:
         client=client,
     )
     return result
+
+
+def _save_and_verify_rename(window, timeout: int = 10) -> str:
+    """Save the active editor and confirm its tab actually renamed to the document
+    number, not just that Save was clicked. The No. field holds that number before
+    saving too (auto-proposed on open), so the expected tab title is known in advance."""
+    expected_title = _sibling_edit(window, "No.").get_value()
+
+    save_btn = [b for b in window.descendants(control_type="Button") if b.window_text() == "Save the current contents"][
+        0
+    ]
+    try:
+        save_btn.invoke()
+    except Exception:
+        save_btn.click_input()
+
+    if not window.child_window(title=expected_title, control_type="TabItem").exists(timeout=timeout):
+        raise ManualReviewRequired(f"document did not save - expected tab {expected_title!r} not found")
+    return expected_title
+
+
+def save_order(window, timeout: int = 10) -> str:
+    """Save the Order and verify its tab renamed to the Order number."""
+    return _save_and_verify_rename(window, timeout=timeout)
+
+
+def save_invoice(window, timeout: int = 10) -> str:
+    """Save the Invoice and verify its tab renamed to the Invoice number."""
+    return _save_and_verify_rename(window, timeout=timeout)
+
+
+def create_linked_invoice(window, timeout: int = 10):
+    """Click the Order's own Invoice follow-up button (not the toolbar's global one)
+    and verify the new Invoice actually copied the Order's data - this is what proves
+    it is the correct linked Invoice, not merely that some Invoice tab opened.
+    """
+    cust_ref_edit = window.child_window(title="Cust.Ref.", control_type="Edit").wrapper_object()
+    order_cust_ref = cust_ref_edit.get_value()
+    order_date = _sibling_edit(window, "Date").get_value()
+    order_address = _address_preview_edit(cust_ref_edit.parent()).get_value()
+    order_total = window.child_window(title="Total", control_type="Edit").wrapper_object().get_value()
+
+    invoice_btn = [b for b in window.descendants(control_type="Button") if b.window_text() == "Invoice"][0]
+    invoice_btn.invoke()
+    window.child_window(title_re=r"\*?New Invoice", control_type="TabItem").wait("exists", timeout=timeout)
+
+    invoice_cust_ref_edit = window.child_window(title="Cust.Ref.", control_type="Edit").wrapper_object()
+    invoice_cust_ref = invoice_cust_ref_edit.get_value()
+    invoice_order_date = _sibling_edit(window, "Order Date").get_value()
+    invoice_address = _address_preview_edit(invoice_cust_ref_edit.parent()).get_value()
+    invoice_total = window.child_window(title="Total", control_type="Edit").wrapper_object().get_value()
+
+    mismatches = []
+    if invoice_cust_ref != order_cust_ref:
+        mismatches.append(f"Cust.Ref. order={order_cust_ref!r} invoice={invoice_cust_ref!r}")
+    if invoice_order_date != order_date:
+        mismatches.append(f"Order Date order={order_date!r} invoice={invoice_order_date!r}")
+    if invoice_address != order_address:
+        mismatches.append(f"address order={order_address!r} invoice={invoice_address!r}")
+    if invoice_total != order_total:
+        mismatches.append(f"Total order={order_total!r} invoice={invoice_total!r}")
+
+    if mismatches:
+        raise ManualReviewRequired(f"linked Invoice does not match its Order: {'; '.join(mismatches)}")
