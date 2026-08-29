@@ -3,6 +3,7 @@ import io
 import json
 import time
 from datetime import datetime
+from decimal import Decimal
 
 from pywinauto import Application
 
@@ -12,13 +13,13 @@ NEW_ORDER_BUTTON_NAME = "Create: New Order"
 VISION_MODEL = "claude-opus-5"
 
 _MATCH_PROMPT = """This image is a cropped search-results table from an accounting app, \
-filtered by company name "{company}".
+filtered by {column} "{value}".
 
 Respond with ONLY a JSON object of this shape:
 {{"row_count": <int>, "exact_match_count": <int>, "exact_match_y_fraction": <float 0.0-1.0 or null>}}
 
 row_count = number of data rows visible (excluding the header row).
-exact_match_count = number of rows whose Company column exactly equals "{company}" \
+exact_match_count = number of rows whose {column} column exactly equals "{value}" \
 (ignoring case and surrounding whitespace).
 exact_match_y_fraction = if exact_match_count is exactly 1, that row's vertical center \
 as a fraction of the image height (0.0 = top, 1.0 = bottom); otherwise null."""
@@ -95,12 +96,21 @@ def set_order_header(window, order_date: str, external_reference: str):
     _price_mode_combo(window).iface_value.SetValue("Net")
 
 
+_SEND_KEYS_SPECIAL = "+^%~(){}"
+
+
 def _type_into(edit, text: str):
     """Type text via real keystrokes. ValuePattern.SetValue does not reliably persist
-    in this app (confirmed on the Debtor Company field), so avoid it here."""
+    in this app (confirmed on the Debtor Company field), so avoid it here.
+
+    send_keys treats +^%~(){} as modifiers/groups, so literal occurrences (e.g. "VAT 19%")
+    must be escaped or they get silently swallowed.
+    """
+    escaped = "".join(f"{{{c}}}" if c in _SEND_KEYS_SPECIAL else c for c in text)
     edit.set_focus()
-    edit.type_keys("^a{DELETE}", with_spaces=True)
-    edit.type_keys(text, with_spaces=True)
+    edit.type_keys("^a")
+    edit.type_keys("{DELETE}")
+    edit.type_keys(escaped, with_spaces=True)
 
 
 def _address_dialog(window, timeout: int = 10):
@@ -148,8 +158,8 @@ def _wait_for_grid_to_settle(pane, timeout: float = 5.0, poll_interval: float = 
         time.sleep(poll_interval)
 
 
-def _ask_vision_match(image, company_name: str, client=None) -> dict:
-    """Ask a vision-capable LLM to read the results grid, since it exposes no rows via UIA."""
+def _ask_vision_match(image, value: str, column: str = "Company", client=None) -> dict:
+    """Ask a vision-capable LLM to read a results grid, since it exposes no rows via UIA."""
     import anthropic
 
     client = client or anthropic.Anthropic()
@@ -165,7 +175,7 @@ def _ask_vision_match(image, company_name: str, client=None) -> dict:
                 "role": "user",
                 "content": [
                     {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": image_data}},
-                    {"type": "text", "text": _MATCH_PROMPT.format(company=company_name)},
+                    {"type": "text", "text": _MATCH_PROMPT.format(column=column, value=value)},
                 ],
             }
         ],
@@ -192,6 +202,8 @@ def resolve_debtor(window, company_name: str, client=None) -> str:
     search_edit = dialog.descendants(control_type="Edit")[0]
     search_edit.set_focus()
     search_edit.type_keys(company_name, with_spaces=True)
+    time.sleep(1.0)  # Fakturama rebuilds part of the dialog's widget tree after filtering,
+    search_edit = dialog.descendants(control_type="Edit")[0]  # invalidating the old reference
     results_pane = _results_pane(dialog, search_edit)
     _wait_for_grid_to_settle(results_pane)
 
@@ -301,3 +313,284 @@ def resolve_or_create_debtor(window, debtor, client=None) -> str:
     if outcome != "selected":
         raise ManualReviewRequired(f"newly created debtor {debtor.company!r} was not found on re-search")
     return "created_and_selected"
+
+
+def _product_dialog(window, timeout: int = 10):
+    """Click the upper product-selection icon beside Items and return the resulting dialog.
+
+    Same bare-Image-with-no-pattern situation as the address icon; live-resolved click.
+    """
+    items_label = [t for t in window.descendants(control_type="Text") if t.window_text() == "Items"][0]
+    scope = items_label.parent()
+    upper_icon = min(scope.descendants(control_type="Image"), key=lambda img: img.rectangle().top)
+    try:
+        upper_icon.set_focus()
+    except Exception:
+        pass
+    upper_icon.click_input()
+
+    dialog_spec = window.child_window(title="Select a product", control_type="Window")
+    dialog_spec.wait("exists", timeout=timeout)
+    return dialog_spec.wrapper_object()
+
+
+def resolve_product(window, sku: str, client=None) -> str:
+    """Search the Order's product selector for sku and act on the result.
+
+    Unlike "Select the address", "Select a product" auto-selects and closes itself the
+    instant the search narrows to one exact match - confirmed live (Total Gross rose by
+    exactly the matched product's price, no OK click involved). What first looked like
+    the dialog crashing was this auto-select. So: dialog gone after typing -> selected,
+    no vision needed. Dialog still open -> no match or ambiguous, same as resolve_debtor.
+    """
+    dialog = _product_dialog(window)
+    search_edit = dialog.descendants(control_type="Edit")[0]
+    search_edit.set_focus()
+    search_edit.type_keys(sku, with_spaces=True)
+    time.sleep(1.0)  # let the dialog either auto-close or finish laying out results
+
+    if not window.child_window(title="Select a product", control_type="Window").exists(timeout=1):
+        return "selected"
+
+    search_edit = dialog.descendants(control_type="Edit")[0]  # tree rebuilt after filtering
+    results_pane = _results_pane(dialog, search_edit)
+    _wait_for_grid_to_settle(results_pane)
+
+    match = _ask_vision_match(results_pane.capture_as_image(), sku, column="Item No.", client=client)
+
+    def click_button(name):
+        btn = [b for b in dialog.descendants(control_type="Button") if b.window_text() == name][0]
+        btn.set_focus()
+        btn.click_input()
+
+    if match["row_count"] == 0:
+        click_button("Cancel")
+        return "no_match"
+
+    if match["exact_match_count"] != 1:
+        click_button("Cancel")
+        raise ManualReviewRequired(f"product search for {sku!r} is ambiguous: {match}")
+
+    rect = results_pane.rectangle()
+    y_offset = int(match["exact_match_y_fraction"] * rect.height())
+    x_offset = int(rect.width() * 0.3)
+    results_pane.click_input(coords=(x_offset, y_offset))
+    click_button("OK")
+    return "selected"
+
+
+def _price_gross_edit(scope):
+    """Price (gross) sits one row above cost price (net); a tight row tolerance (unlike
+    _sibling_edit's) is needed so the two adjacent unlabeled Edits aren't confused."""
+    label = [t for t in scope.descendants(control_type="Text") if t.window_text() == "Price (gross)"][0]
+    label_rect = label.rectangle()
+    candidates = [
+        e
+        for e in scope.descendants(control_type="Edit")
+        if abs(e.rectangle().top - label_rect.top) < 10 and e.rectangle().left > label_rect.left
+    ]
+    return min(candidates, key=lambda e: e.rectangle().left)
+
+
+def resolve_or_create_vat(window, vat_percent: str):
+    """Ensure "VAT {pct}%" exists in the open product editor's VAT dropdown.
+
+    Checked directly via UIA: unlike the custom-painted grids, this VAT ComboBox is a
+    real SWT Combo whose options are readable via ExpandCollapse + ListItem children -
+    confirmed live, so no vision call is needed here. Only "Free of Tax" exists by
+    default (confirmed live), so creation is genuinely required for any real VAT rate.
+    """
+    vat_name = f"VAT {vat_percent}%"
+    vat_combo = window.child_window(title="VAT", control_type="ComboBox").wrapper_object()
+    vat_combo.expand()
+    options = [i.window_text() for i in vat_combo.descendants(control_type="ListItem")]
+    vat_combo.collapse()
+    if vat_name in options:
+        vat_combo.iface_value.SetValue(vat_name)
+        return
+
+    vats_label = [t for t in window.descendants(control_type="Text") if t.window_text() == "VATs"][0]
+    vats_label.set_focus()
+    vats_label.double_click_input()
+
+    create_btn = [b for b in window.descendants(control_type="Button") if b.window_text() == "Create a new tax rate"][
+        0
+    ]
+    create_btn.invoke()
+
+    name_edit = window.child_window(title="Name", control_type="Edit").wrapper_object()
+    desc_edit = window.child_window(title="Description", control_type="Edit").wrapper_object()
+    value_edit = window.child_window(title="Value", control_type="Edit").wrapper_object()
+    _type_into(name_edit, vat_name)
+    _type_into(desc_edit, vat_name)
+    _type_into(value_edit, vat_percent)
+    # VAT code (E-Invoice) already defaults to "S (Standard rate)" - leave it.
+
+    save_btn = [b for b in window.descendants(control_type="Button") if b.window_text() == "Save the current contents"][
+        0
+    ]
+    try:
+        save_btn.invoke()
+    except Exception:
+        save_btn.click_input()
+
+    # Switching to the VATs list/editor drops the product editor's controls until its
+    # tab is reactivated (same behaviour as the Order tab in create_debtor).
+    product_tab = window.child_window(title_re=r"\*?New product", control_type="TabItem").wrapper_object()
+    try:
+        product_tab.set_focus()
+    except Exception:
+        pass
+    product_tab.click_input()
+
+    vat_combo = window.child_window(title="VAT", control_type="ComboBox").wrapper_object()
+    vat_combo.expand()
+    options = [i.window_text() for i in vat_combo.descendants(control_type="ListItem")]
+    vat_combo.collapse()
+    if vat_name not in options:
+        raise ManualReviewRequired(f"created VAT rate {vat_name!r} did not appear in the product VAT dropdown")
+    vat_combo.iface_value.SetValue(vat_name)
+
+
+def create_product(window, sku: str, description: str, price_gross: str, vat_percent: str):
+    """Open a New Product editor (Order stays open), resolve/create its VAT, fill, save."""
+    new_product_btn = [b for b in window.descendants(control_type="Button") if b.window_text() == "Create a new product"][
+        0
+    ]
+    new_product_btn.invoke()
+
+    item_no_spec = window.child_window(title="Item Number", control_type="Edit")
+    item_no_spec.wait("exists", timeout=10)
+
+    resolve_or_create_vat(window, vat_percent)
+
+    item_no_edit = window.child_window(title="Item Number", control_type="Edit").wrapper_object()
+    name_edit = window.child_window(title="Name", control_type="Edit").wrapper_object()
+    desc_edit = window.child_window(title="Description", control_type="Edit").wrapper_object()
+    scope = item_no_edit.parent()
+    price_edit = _price_gross_edit(scope)
+
+    _type_into(item_no_edit, sku)
+    _type_into(name_edit, description)
+    _type_into(desc_edit, description)
+    _type_into(price_edit, price_gross)
+
+    save_btn = [b for b in window.descendants(control_type="Button") if b.window_text() == "Save the current contents"][
+        0
+    ]
+    try:
+        save_btn.invoke()
+    except Exception:
+        save_btn.click_input()
+
+    order_tab = window.child_window(title_re=r"\*?New Order", control_type="TabItem").wrapper_object()
+    try:
+        order_tab.set_focus()
+    except Exception:
+        pass
+    order_tab.click_input()
+
+
+_CELL_POSITION_PROMPT = """This image shows a data grid's header row and its data rows \
+from an accounting app. Find the data row whose "Item No." column exactly equals "{sku}".
+
+Respond with ONLY a JSON object of this shape:
+{{"row_y_fraction": <float 0.0-1.0>, "columns": {{"Qty.": <float>, "U.Price": <float>, "Discount": <float>}}}}
+
+row_y_fraction = that row's vertical center as a fraction of the image height (0.0 = top, 1.0 = bottom).
+For each listed column name, report the horizontal center of that column's cell in the \
+matched row, as a fraction of the image width (0.0 = left edge, 1.0 = right edge), read \
+from the header labels directly above."""
+
+
+def _ask_vision_cell_positions(image, sku: str, client=None) -> dict:
+    """Ask a vision-capable LLM for the target row/column positions - the Items grid
+    exposes zero cell-level UIA elements even with a real line present (confirmed live)."""
+    import anthropic
+
+    client = client or anthropic.Anthropic()
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    image_data = base64.standard_b64encode(buf.getvalue()).decode("utf-8")
+
+    response = client.messages.create(
+        model=VISION_MODEL,
+        max_tokens=256,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": image_data}},
+                    {"type": "text", "text": _CELL_POSITION_PROMPT.format(sku=sku)},
+                ],
+            }
+        ],
+    )
+    text = next((block.text for block in response.content if block.type == "text"), "").strip()
+    if text.startswith("```"):
+        text = text.strip("`").removeprefix("json").strip()
+    return json.loads(text)
+
+
+def set_line_values(window, sku: str, quantity: str, unit_price: str, discount_percent: str, client=None):
+    """Set Qty/U.Price/Discount on the Order line matching sku.
+
+    The Items grid (header and rows) has zero UIA cell elements even with a real line
+    present (confirmed live), so cell positions come from a vision read of the same
+    grid image, keyed to the header labels. Each cell edit is click + F2 + select-all +
+    type + Enter - confirmed live against the real document model (Total Gross changed
+    from $0.00 to the expected amount after a U.Price edit), not assumed.
+    """
+    items_label = [t for t in window.descendants(control_type="Text") if t.window_text() == "Items"][0]
+    grid_area = items_label.parent().parent()
+    total_gross = window.child_window(title="Total Gross", control_type="Edit").wrapper_object()
+    before = total_gross.get_value()
+
+    positions = _ask_vision_cell_positions(grid_area.capture_as_image(), sku, client=client)
+    rect = grid_area.rectangle()
+    row_y = int(positions["row_y_fraction"] * rect.height())
+
+    from pywinauto.keyboard import send_keys
+
+    for column, value in (("Qty.", quantity), ("U.Price", unit_price), ("Discount", discount_percent)):
+        x = int(positions["columns"][column] * rect.width())
+        grid_area.click_input(coords=(x, row_y))
+        send_keys("{F2}")
+        send_keys("^a")
+        send_keys("{DELETE}")
+        send_keys(value)
+        send_keys("{ENTER}")
+
+    after = total_gross.get_value()
+    if after == before and Decimal(quantity) > 0 and Decimal(unit_price) > 0:
+        raise ManualReviewRequired(f"setting line values for {sku!r} did not change Total Gross ({after})")
+
+
+def resolve_or_create_product(window, line_item, client=None) -> str:
+    """Select line_item.sku on the Order if it exists; otherwise create and select it,
+    then set its Qty/U.Price/Discount. Mirrors resolve_or_create_debtor.
+
+    line_item: an extraction.LineItem. Returns "selected_existing" or "created_and_selected".
+    """
+    outcome = resolve_product(window, line_item.sku, client=client)
+    if outcome == "no_match":
+        price_gross = (line_item.unit_net_price * (Decimal("1") + line_item.vat_percent / Decimal("100"))).quantize(
+            Decimal("0.01")
+        )
+        create_product(window, line_item.sku, line_item.description, str(price_gross), str(line_item.vat_percent))
+        outcome = resolve_product(window, line_item.sku, client=client)
+        if outcome != "selected":
+            raise ManualReviewRequired(f"newly created product {line_item.sku!r} was not found on re-search")
+        result = "created_and_selected"
+    else:
+        result = "selected_existing"
+
+    set_line_values(
+        window,
+        line_item.sku,
+        str(line_item.quantity),
+        str(line_item.unit_net_price),
+        str(line_item.discount_percent),
+        client=client,
+    )
+    return result
