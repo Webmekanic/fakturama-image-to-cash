@@ -525,14 +525,26 @@ def resolve_or_create_vat(window, vat_percent: str):
     except Exception:
         save_btn.click_input()
 
-    # Switching to the VATs list/editor drops the product editor's controls until its
-    # tab is reactivated (same behaviour as the Order tab in create_debtor).
+    # The still-open product editor's VAT combo caches its options at open time and
+    # does not pick up a VAT rate created afterward, even after switching back to it
+    # and waiting (confirmed live: the same stale options list came back every time).
+    # Closing and reopening it gives a fresh combo populated from the database - safe
+    # here because no product fields have been typed into it yet at this point.
+    from pywinauto.keyboard import send_keys
+
     product_tab = window.child_window(title_re=r"\*?New product", control_type="TabItem").wrapper_object()
     try:
         product_tab.set_focus()
     except Exception:
         pass
     product_tab.click_input()
+    send_keys("^w")
+
+    new_product_btn = [b for b in window.descendants(control_type="Button") if b.window_text() == "Create a new product"][
+        0
+    ]
+    new_product_btn.invoke()
+    window.child_window(title="Item Number", control_type="Edit").wait("exists", timeout=10)
 
     vat_combo = window.child_window(title="VAT", control_type="ComboBox").wrapper_object()
     vat_combo.expand()
