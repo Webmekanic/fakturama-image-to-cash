@@ -52,6 +52,12 @@ Run the full workflow against the real, running Fakturama and a real order image
 uv run --env-file .env fakturama-image-to-cash screenshots\01-source-order.png
 ```
 
+On success it prints the saved Order and Invoice numbers, e.g.:
+
+```
+Order saved as PO000001, linked Invoice saved as INV000001
+```
+
 If any step can't be confidently verified (an ambiguous match, a value that didn't
 persist, totals that don't reconcile), the run stops and raises
 `fakturama_image_to_cash.uia.ManualReviewRequired` with a description of what couldn't
